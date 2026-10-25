@@ -56,7 +56,6 @@ uint8_t NUMBER[160] = {
   B01000010,
   B01000010,
   B01000010,
-  B01000010,
   B00111100,
   B00000000,
   //1
@@ -158,6 +157,7 @@ uint8_t NUMBER[160] = {
   B01000010,
   B01000010,
   B01000010,
+  B01000010,
   B00111100,
   B00000000,
   //7
@@ -216,8 +216,10 @@ uint8_t NUMBER[160] = {
 
 void maxTransferCMD(uint8_t address, uint8_t value) {  
   digitalWrite(SS_PIN, LOW);   
-  SPI.transfer(address);      // Send address.
-  SPI.transfer(value);        // Send the value.
+  for (uint8_t i = 0; i < 8; i++) { // Send to all 8 daisy-chained modules.
+    SPI.transfer(address);    // Send address.
+    SPI.transfer(value);      // Send the value.
+  }
   digitalWrite(SS_PIN, HIGH); // Finish transfer.
 }
 
@@ -257,26 +259,30 @@ void draw_time(uint8_t hour, uint8_t minute) {
   }
 }
 
-// Convert a UTC time string "HH:MM" and apply the DST offset to get local time
-// Returns true if successful
+// Convert a UTC epoch and apply the DST offset to get local time
+// Returns true if NTP has synced
 bool getLocalTime(uint8_t &localHour, uint8_t &localMinute) {
   timeClient.update();
-  String utcStr = timeClient.getFormattedTime();  // e.g. "14:30:00"
 
-  int utcHour = utcStr.substring(0, 2).toInt();
-  int utcMinute = utcStr.substring(3, 5).toInt();
-
-  // Get the current UTC epoch to determine DST status
+  if (!timeClient.isTimeSet()) {
+    // NTP hasn't synced yet
+    localHour = 0;
+    localMinute = 0;
+    return false;
+  }
+  // Get the current UTC epoch
   uint32_t utcEpoch = timeClient.getEpochTime();
+
+  // Get the current UTC offset for DST
   int currentOffset = getDSTOffset(utcEpoch);
 
   // Apply the offset to get local time
-  long localSeconds = utcEpoch + currentOffset;
+  uint32_t localSeconds = utcEpoch + currentOffset;
 
   // Handle day wrap-around (in case DST transition crosses midnight)
   uint16_t year;
   uint8_t month, day, hour, minute, second;
-  epochToTime((uint32_t)localSeconds, year, month, day, hour, minute, second);
+  epochToTime(localSeconds, year, month, day, hour, minute, second);
 
   localHour = hour;
   localMinute = minute;
@@ -284,29 +290,67 @@ bool getLocalTime(uint8_t &localHour, uint8_t &localMinute) {
 }
 
 void setup() {
+  Serial.begin(115200);
+  Serial.println("\n--- Clock Starting ---");
+
   pinMode(SS_PIN, OUTPUT);  
 
   SPI.setBitOrder(MSBFIRST);
   SPI.begin();
 
   maxTransferCMD(MAX7219_TEST, 0x00);
-  WiFi.begin("tony_NET", "REMOVED");
+  
+  Serial.print("Connecting to WiFi: ");
+  Serial.println(ssid);
+  WiFi.begin(ssid, password);
+  int wifiAttempts = 0;
   while (WiFi.status() != WL_CONNECTED)
   {
     delay(200);
+    Serial.print(".");
+    wifiAttempts++;
+    if (wifiAttempts > 30) {
+      Serial.println("\nWiFi connection FAILED!");
+      // Display error pattern: flash all LEDs
+      for (uint8_t i = 0; i < 8; i++) {
+        maxTransferDATA(i + 1, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF);
+      }
+      while (true) delay(500);
+    }
   }
+  Serial.println("\nWiFi connected! IP: " + WiFi.localIP().toString());
+  
   timeClient.begin();
+  Serial.println("NTP initialized.");
 
   maxTransferCMD(MAX7219_DECODE_MODE, 0x00); // Disable BCD mode. 
   maxTransferCMD(MAX7219_BRIGHTNESS, 0x08);  // Set brightness (0x00 -> 0x0F)
   maxTransferCMD(MAX7219_SCAN_LIMIT, 0x0f);  // Scan all digits.
   maxTransferCMD(MAX7219_SHUTDOWN, 0x01);    // Turn on chip.
+  Serial.println("MAX7219 initialized.");
 }
 
 void loop() {      
+  static int debugCount = 0;
   uint8_t localHour, localMinute;
   if (getLocalTime(localHour, localMinute)) {
     draw_time(localHour, localMinute);
+    if (debugCount < 5) {
+      char buf[12];
+      sprintf(buf, "%02d:%02d", localHour, localMinute);
+      Serial.print("Time: ");
+      Serial.print(buf);
+      Serial.print(" | WiFi: ");
+      Serial.print(WiFi.localIP().toString());
+      Serial.print(" | Epoch: ");
+      Serial.println(timeClient.getEpochTime());
+      debugCount++;
+    }
+  } else {
+    if (debugCount < 10) {
+      Serial.println("NTP not ready yet...");
+      debugCount++;
+    }
   }
   delay(1000); 
 }

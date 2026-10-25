@@ -14,7 +14,7 @@ WiFi-connected NTP clock driving two cascaded MAX7219 8×8 LED modules (16×32 p
 ## Hardware
 
 - **ESP8266** (NodeMCU / WeMos D1 Mini)
-- **2× MAX7219** 8×8 LED dot-matrix modules, daisy-chained
+- **8× MAX7219** 8×8 LED dot-matrix modules, daisy-chained (4 wide × 2 high)
 - **GPIO 15 (D8)** — SPI chip select
 
 ## Timezone Configuration

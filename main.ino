@@ -54,6 +54,11 @@ const char* password     = "46237057";         // WiFi password
 // (the ESP8266 normally re-syncs every hour).
 #define STALE_AFTER_HOURS 3
 
+// Date: shown as DD.MM for DATE_SHOW_SECONDS every minute, from second
+// DATE_AT_SECOND. Set DATE_SHOW_SECONDS to 0 to never show the date.
+#define DATE_AT_SECOND    30
+#define DATE_SHOW_SECONDS 3
+
 // If the clock has never synced the time this many minutes after power-up
 // (e.g. WiFi stack stuck), restart it. Once the time is known the clock keeps
 // running on its own and WiFi reconnects automatically in the background.
@@ -280,18 +285,41 @@ void maxTransferDATA(uint8_t address, uint8_t v1, uint8_t v2, uint8_t v3, uint8_
   digitalWrite(SS_PIN, HIGH); // Finish transfer.
 }
 
+// Separator drawn in the 2 middle columns between the digit pairs
+#define SEP_NONE   0
+#define SEP_COLON  1                            // Time, HH:MM
+#define SEP_PERIOD 2                            // Date, DD.MM
+
+// One row (0-15) of a digit. The left pair is shifted 1 px left and the
+// right pair 1 px right, leaving a 4 px gap in the middle for the separator.
+uint8_t digitRow(uint8_t digit, uint8_t row, bool leftPair) {
+  uint8_t v = NUMBER[row + digit * 16];
+  return leftPair ? v << 1 : v >> 1;
+}
+
+bool sepPixel(uint8_t sep, uint8_t row) {
+  if (sep == SEP_COLON) return row == 4 || row == 5 || row == 10 || row == 11;
+  if (sep == SEP_PERIOD) return row == 13 || row == 14;
+  return false;
+}
+
+// Draw two 2-digit numbers (e.g. hour/minute or day/month).
 // dot: light the bottom-right pixel (status indicator)
-void draw_time(uint8_t hour, uint8_t minute, bool dot) {
-  uint8_t a = hour / 10;
-  uint8_t b = hour % 10;
-  uint8_t c = minute / 10;
-  uint8_t d = minute % 10;
+void draw_digits(uint8_t left, uint8_t right, uint8_t sep, bool dot) {
+  uint8_t a = left / 10;
+  uint8_t b = left % 10;
+  uint8_t c = right / 10;
+  uint8_t d = right % 10;
   for (uint8_t i = 0; i < 8; i++) {
-    maxTransferDATA(i + 1, NUMBER[i + a * 16], NUMBER[i + b * 16],
-                    NUMBER[i + c * 16], NUMBER[i + d * 16],
-                    NUMBER[i + 8 + a * 16], NUMBER[i + 8 + b * 16],
-                    NUMBER[i + 8 + c * 16],
-                    NUMBER[i + 8 + d * 16] | ((dot && i == 7) ? 0x01 : 0x00));
+    uint8_t top = i, bottom = i + 8;
+    maxTransferDATA(i + 1, digitRow(a, top, true),
+                    digitRow(b, top, true) | (sepPixel(sep, top) ? 0x01 : 0x00),
+                    digitRow(c, top, false) | (sepPixel(sep, top) ? 0x80 : 0x00),
+                    digitRow(d, top, false),
+                    digitRow(a, bottom, true),
+                    digitRow(b, bottom, true) | (sepPixel(sep, bottom) ? 0x01 : 0x00),
+                    digitRow(c, bottom, false) | (sepPixel(sep, bottom) ? 0x80 : 0x00),
+                    digitRow(d, bottom, false) | ((dot && i == 7) ? 0x01 : 0x00));
   }
 }
 
@@ -304,19 +332,10 @@ void draw_blank(bool dot) {
 
 // Get the current local time (time zone and DST applied by the ESP8266)
 // Returns false until the first NTP sync
-bool getLocalTime(uint8_t &localHour, uint8_t &localMinute) {
+bool readLocalTime(struct tm &local) {
   time_t now = time(nullptr);
-  if (now < 1700000000) {
-    // NTP hasn't synced yet (clock still counts from 1970)
-    localHour = 0;
-    localMinute = 0;
-    return false;
-  }
-
-  struct tm local;
+  if (now < 1700000000) return false;           // Not synced yet (still counting from 1970)
   localtime_r(&now, &local);
-  localHour = local.tm_hour;
-  localMinute = local.tm_min;
   return true;
 }
 
@@ -382,13 +401,15 @@ void loop() {
   }
   if (otaStarted) ArduinoOTA.handle();
 
-  // Redraw once per second; loop() itself runs continuously so OTA stays responsive
-  static unsigned long lastDraw = 0;
-  if (millis() - lastDraw < 1000) {
+  // Redraw when the second changes; loop() itself runs continuously so OTA
+  // stays responsive and the colon blinks in step with the seconds
+  static time_t lastSecond = 0;
+  time_t nowSecond = time(nullptr);
+  if (nowSecond == lastSecond) {
     delay(10);
     return;
   }
-  lastDraw = millis();
+  lastSecond = nowSecond;
 
   if (!everSynced && millis() > RESTART_IF_NO_SYNC_MIN * 60UL * 1000UL) {
     Serial.println("No time sync since power-up, restarting.");
@@ -396,15 +417,23 @@ void loop() {
   }
 
   static int debugCount = 0;
-  uint8_t localHour, localMinute;
-  if (getLocalTime(localHour, localMinute)) {
-    bool night = localHour >= NIGHT_START_HOUR || localHour < NIGHT_END_HOUR;
+  struct tm local;
+  if (readLocalTime(local)) {
+    bool night = local.tm_hour >= NIGHT_START_HOUR || local.tm_hour < NIGHT_END_HOUR;
     dimOnMs = night ? NIGHT_ON_MS : DAY_ON_MS;
     bool stale = millis() - lastSyncMillis > STALE_AFTER_HOURS * 3600UL * 1000UL;
-    draw_time(localHour, localMinute, stale);
+    bool showDate = local.tm_sec >= DATE_AT_SECOND &&
+                    local.tm_sec < DATE_AT_SECOND + DATE_SHOW_SECONDS;
+    if (showDate) {
+      draw_digits(local.tm_mday, local.tm_mon + 1, SEP_PERIOD, stale);
+    } else {
+      // Colon blinks: on during even seconds
+      draw_digits(local.tm_hour, local.tm_min,
+                  local.tm_sec % 2 == 0 ? SEP_COLON : SEP_NONE, stale);
+    }
     if (debugCount < 5) {
       char buf[12];
-      sprintf(buf, "%02d:%02d", localHour, localMinute);
+      sprintf(buf, "%02d:%02d", local.tm_hour, local.tm_min);
       Serial.print("Time: ");
       Serial.print(buf);
       Serial.print(" | WiFi: ");

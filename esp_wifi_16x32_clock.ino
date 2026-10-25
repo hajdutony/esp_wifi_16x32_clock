@@ -1,0 +1,640 @@
+#include <SPI.h>
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <ESP8266mDNS.h>
+#include <WiFiManager.h>                        // https://github.com/tzapu/WiFiManager
+#include <EEPROM.h>
+#include <Ticker.h>
+#include <ArduinoOTA.h>
+#include <time.h>
+#include <coredecls.h>                      // settimeofday_cb()
+
+// ============================================================================
+// Configuration
+//
+// WiFi is set up from a phone: if the clock cannot join a known network it
+// opens its own network SETUP_AP_NAME; connect to it and pick your WiFi.
+// Brightness, night hours, time zone and the date display are changed on the
+// settings page at http://wifi-clock.local and saved in flash. The values
+// below are only the defaults used on first boot.
+// ============================================================================
+
+#define OTA_HOSTNAME "wifi-clock"               // Network name (OTA updates, settings page)
+#define OTA_PASSWORD ""                         // Set to require a password for updates
+#define SETUP_AP_NAME "wifi-clock-setup"        // WiFi network opened for setup
+#define SETUP_PORTAL_SECONDS 300                // Close the setup network after 5 min
+
+#define SS_PIN 15                              // ESP8266 GPIO pin for MAX7219 CS
+
+// MAX7219 SPI Driver commands
+#define MAX7219_TEST     0x0f
+#define MAX7219_BRIGHTNESS 0x0a
+#define MAX7219_SCAN_LIMIT 0x0b
+#define MAX7219_DECODE_MODE 0x09
+#define MAX7219_SHUTDOWN   0x0C
+
+// Brightness: hardware intensity (0x00 = lowest the MAX7219 can do), further
+// dimmed in software by lighting the display only dimOnMs out of every
+// DIM_PERIOD_MS milliseconds. Brightness levels on the settings page are
+// 0-10, i.e. 0-100% of the lowest hardware brightness in 10% steps.
+#define BRIGHTNESS    0x00
+#define DIM_PERIOD_MS 10
+
+// Defaults (first boot / after a settings reset)
+#define DEFAULT_DAY_LEVEL       3               // 30% during the day
+#define DEFAULT_NIGHT_LEVEL     1               // 10% at night
+#define DEFAULT_NIGHT_START     22              // Night mode from 22:00...
+#define DEFAULT_NIGHT_END       7               // ...until 07:00 (local time)
+#define DEFAULT_DATE_AT_SECOND  30              // Show the date from second 30...
+#define DEFAULT_DATE_SECONDS    3               // ...for 3 seconds (0 = never)
+
+// POSIX time zone string; the ESP8266 handles summer/winter time from it.
+// Europe/Bratislava: CET (UTC+1), CEST (UTC+2) from the last Sunday of March
+// 02:00 until the last Sunday of October 03:00.
+#define DEFAULT_TIME_ZONE "CET-1CEST,M3.5.0,M10.5.0/3"
+
+// Time settings
+#define NTP_SERVER "europe.pool.ntp.org"
+
+// Status dot (bottom-right pixel): blinks while waiting for the first time
+// sync, stays on if the time has not been synced for STALE_AFTER_HOURS
+// (the ESP8266 normally re-syncs every hour).
+#define STALE_AFTER_HOURS 3
+
+// If the clock has never synced the time this many minutes after power-up
+// (e.g. WiFi stack stuck), restart it. Once the time is known the clock keeps
+// running on its own and WiFi reconnects automatically in the background.
+#define RESTART_IF_NO_SYNC_MIN 10
+
+// Settings saved in flash (EEPROM emulation)
+#define SETTINGS_MAGIC 0xC10C0001               // Change when the struct layout changes
+struct Settings {
+  uint32_t magic;
+  uint8_t dayLevel;                             // 0-10
+  uint8_t nightLevel;                           // 0-10
+  uint8_t nightStart;                           // Hour 0-23
+  uint8_t nightEnd;                             // Hour 0-23 (same as start = no night mode)
+  uint8_t dateAtSecond;                         // 0-59
+  uint8_t dateSeconds;                          // 0-10, 0 = never show the date
+  char timeZone[64];
+};
+Settings settings;
+
+Ticker dimTicker;
+uint8_t dimOnMs = DEFAULT_DAY_LEVEL;            // Current lit time, set from loop()
+unsigned long lastSyncMillis = 0;               // millis() of the last NTP sync
+bool everSynced = false;
+
+WiFiManager wifiManager;
+ESP8266WebServer server(80);
+
+uint8_t NUMBER[160] = {
+  //0
+  B00000000,
+  B00111100,
+  B01000010,
+  B01000010,
+  B01000010,
+  B01000010,
+  B01000010,
+  B01000010,
+  B01000010,
+  B01000010,
+  B01000010,
+  B01000010,
+  B01000010,
+  B01000010,
+  B00111100,
+  B00000000,
+  //1
+  B00000000,
+  B00000010,
+  B00000110,
+  B00001010,
+  B00010010,
+  B00100010,
+  B00000010,
+  B00000010,
+  B00000010,
+  B00000010,
+  B00000010,
+  B00000010,
+  B00000010,
+  B00000010,
+  B00000010,
+  B00000000,
+  //2
+  B00000000,
+  B00111100,
+  B01000010,
+  B00000010,
+  B00000010,
+  B00000010,
+  B00000010,
+  B00001100,
+  B00110000,
+  B01000000,
+  B01000000,
+  B01000000,
+  B01000000,
+  B01000010,
+  B00111100,
+  B00000000,
+  //3
+  B00000000,
+  B00111100,
+  B01000010,
+  B00000010,
+  B00000010,
+  B00000010,
+  B00000010,
+  B00001100,
+  B00110010,
+  B00000010,
+  B00000010,
+  B00000010,
+  B00000010,
+  B01000010,
+  B00111100,
+  B00000000,
+  //4
+  B00000000,
+  B01000010,
+  B01000010,
+  B01000010,
+  B01000010,
+  B01000010,
+  B01000010,
+  B01001100,
+  B00110010,
+  B00000010,
+  B00000010,
+  B00000010,
+  B00000010,
+  B00000010,
+  B00000010,
+  B00000000,
+  //5
+  B00000000,
+  B01111110,
+  B01000000,
+  B01000000,
+  B01000000,
+  B01000000,
+  B01000000,
+  B01001100,
+  B00110010,
+  B00000010,
+  B00000010,
+  B00000010,
+  B00000010,
+  B01000010,
+  B00111100,
+  B00000000,
+  //6
+  B00000000,
+  B00111100,
+  B01000010,
+  B01000000,
+  B01000000,
+  B01000000,
+  B01000000,
+  B01001100,
+  B00110010,
+  B01000010,
+  B01000010,
+  B01000010,
+  B01000010,
+  B01000010,
+  B00111100,
+  B00000000,
+  //7
+  B00000000,
+  B01111110,
+  B00000010,
+  B00000010,
+  B00000100,
+  B00000100,
+  B00000100,
+  B00001000,
+  B00001000,
+  B00001000,
+  B00010000,
+  B00010000,
+  B00010000,
+  B00100000,
+  B00100000,
+  B00000000,
+  //8
+  B00000000,
+  B00111100,
+  B01000010,
+  B01000010,
+  B01000010,
+  B01000010,
+  B01000010,
+  B01001100,
+  B00110010,
+  B01000010,
+  B01000010,
+  B01000010,
+  B01000010,
+  B01000010,
+  B00111100,
+  B00000000,
+  //9
+  B00000000,
+  B00111100,
+  B01000010,
+  B01000010,
+  B01000010,
+  B01000010,
+  B01000010,
+  B01001100,
+  B00110010,
+  B00000010,
+  B00000010,
+  B00000010,
+  B00000010,
+  B01000010,
+  B00111100,
+  B00000000,
+};
+
+
+void maxTransferCMD(uint8_t address, uint8_t value) {  
+  digitalWrite(SS_PIN, LOW);   
+  for (uint8_t i = 0; i < 8; i++) { // Send to all 8 daisy-chained modules.
+    SPI.transfer(address);    // Send address.
+    SPI.transfer(value);      // Send the value.
+  }
+  digitalWrite(SS_PIN, HIGH); // Finish transfer.
+}
+
+// Called every 1 ms: switch the display on for dimOnMs, off for the rest
+// of the period. Ticker callbacks run between loop() yields, so they never
+// interrupt an SPI transfer in progress.
+void dimTick() {
+  static uint8_t tick = 0;
+  if (tick == 0 && dimOnMs > 0) maxTransferCMD(MAX7219_SHUTDOWN, 0x01);
+  else if (tick == dimOnMs) maxTransferCMD(MAX7219_SHUTDOWN, 0x00);
+  if (++tick >= DIM_PERIOD_MS) tick = 0;
+}
+
+void maxTransferDATA(uint8_t address, uint8_t v1, uint8_t v2, uint8_t v3, uint8_t v4, uint8_t v5, uint8_t v6, uint8_t v7, uint8_t v8) {  
+  digitalWrite(SS_PIN, LOW);   
+
+  SPI.transfer(address);      // Send the value.
+  SPI.transfer(v1);           // Send the value.
+  SPI.transfer(address);      // Send address. 
+  SPI.transfer(v2);           // Send the value.
+  SPI.transfer(address);      // Send address. 
+  SPI.transfer(v3);           // Send the value.
+  SPI.transfer(address);      // Send address. 
+  SPI.transfer(v4);           // Send the value.
+  SPI.transfer(address);      // Send address. 
+  SPI.transfer(v5);           // Send the value.
+  SPI.transfer(address);      // Send address. 
+  SPI.transfer(v6);           // Send the value.
+  SPI.transfer(address);      // Send address. 
+  SPI.transfer(v7);           // Send the value.
+  SPI.transfer(address);      // Send address. 
+  SPI.transfer(v8);           // Send the value.
+
+  digitalWrite(SS_PIN, HIGH); // Finish transfer.
+}
+
+// Separator drawn in the 2 middle columns between the digit pairs
+#define SEP_NONE   0
+#define SEP_COLON  1                            // Time, HH:MM
+#define SEP_PERIOD 2                            // Date, DD.MM
+
+// One row (0-15) of a digit. The left pair is shifted 1 px left and the
+// right pair 1 px right, leaving a 4 px gap in the middle for the separator.
+uint8_t digitRow(uint8_t digit, uint8_t row, bool leftPair) {
+  uint8_t v = NUMBER[row + digit * 16];
+  return leftPair ? v << 1 : v >> 1;
+}
+
+bool sepPixel(uint8_t sep, uint8_t row) {
+  if (sep == SEP_COLON) return row == 4 || row == 5 || row == 10 || row == 11;
+  if (sep == SEP_PERIOD) return row == 13 || row == 14;
+  return false;
+}
+
+// Draw two 2-digit numbers (e.g. hour/minute or day/month).
+// dot: light the bottom-right pixel (status indicator)
+void draw_digits(uint8_t left, uint8_t right, uint8_t sep, bool dot) {
+  uint8_t a = left / 10;
+  uint8_t b = left % 10;
+  uint8_t c = right / 10;
+  uint8_t d = right % 10;
+  for (uint8_t i = 0; i < 8; i++) {
+    uint8_t top = i, bottom = i + 8;
+    maxTransferDATA(i + 1, digitRow(a, top, true),
+                    digitRow(b, top, true) | (sepPixel(sep, top) ? 0x01 : 0x00),
+                    digitRow(c, top, false) | (sepPixel(sep, top) ? 0x80 : 0x00),
+                    digitRow(d, top, false),
+                    digitRow(a, bottom, true),
+                    digitRow(b, bottom, true) | (sepPixel(sep, bottom) ? 0x01 : 0x00),
+                    digitRow(c, bottom, false) | (sepPixel(sep, bottom) ? 0x80 : 0x00),
+                    digitRow(d, bottom, false) | ((dot && i == 7) ? 0x01 : 0x00));
+  }
+}
+
+// Blank display with only the status dot (before the first time sync)
+void draw_blank(bool dot) {
+  for (uint8_t i = 0; i < 8; i++) {
+    maxTransferDATA(i + 1, 0, 0, 0, 0, 0, 0, 0, (dot && i == 7) ? 0x01 : 0x00);
+  }
+}
+
+// Get the current local time (time zone and DST applied by the ESP8266)
+// Returns false until the first NTP sync
+bool readLocalTime(struct tm &local) {
+  time_t now = time(nullptr);
+  if (now < 1700000000) return false;           // Not synced yet (still counting from 1970)
+  localtime_r(&now, &local);
+  return true;
+}
+
+// ---- Settings ---------------------------------------------------------------
+
+void defaultSettings() {
+  settings.magic = SETTINGS_MAGIC;
+  settings.dayLevel = DEFAULT_DAY_LEVEL;
+  settings.nightLevel = DEFAULT_NIGHT_LEVEL;
+  settings.nightStart = DEFAULT_NIGHT_START;
+  settings.nightEnd = DEFAULT_NIGHT_END;
+  settings.dateAtSecond = DEFAULT_DATE_AT_SECOND;
+  settings.dateSeconds = DEFAULT_DATE_SECONDS;
+  strlcpy(settings.timeZone, DEFAULT_TIME_ZONE, sizeof(settings.timeZone));
+}
+
+void loadSettings() {
+  EEPROM.begin(sizeof(Settings));
+  EEPROM.get(0, settings);
+  settings.timeZone[sizeof(settings.timeZone) - 1] = '\0';
+  if (settings.magic != SETTINGS_MAGIC) {
+    Serial.println("No saved settings, using defaults.");
+    defaultSettings();
+  }
+}
+
+void saveSettings() {
+  EEPROM.put(0, settings);
+  EEPROM.commit();
+}
+
+void applyTimeZone() {
+  setenv("TZ", settings.timeZone, 1);
+  tzset();
+}
+
+// Night period may cross midnight (22 -> 7) or not (1 -> 6)
+bool isNight(uint8_t hour) {
+  if (settings.nightStart == settings.nightEnd) return false;
+  if (settings.nightStart < settings.nightEnd)
+    return hour >= settings.nightStart && hour < settings.nightEnd;
+  return hour >= settings.nightStart || hour < settings.nightEnd;
+}
+
+// POSIX TZ strings only use these characters; rejecting anything else also
+// keeps the value safe to put back into the settings page
+bool validTimeZone(const String &tz) {
+  if (tz.length() == 0 || tz.length() >= sizeof(settings.timeZone)) return false;
+  for (char ch : tz) {
+    if (!isalnum(ch) && !strchr(",./+-<>:", ch)) return false;
+  }
+  return true;
+}
+
+// ---- Settings web page ------------------------------------------------------
+
+String numberInput(const char *name, int value, int min, int max) {
+  return String("<input type=number name=") + name + " value=" + value +
+         " min=" + min + " max=" + max + " required>";
+}
+
+void handleRoot() {
+  struct tm local;
+  char timeStr[24] = "not synced yet";
+  if (readLocalTime(local)) strftime(timeStr, sizeof(timeStr), "%d.%m.%Y %H:%M:%S", &local);
+  String lastSync = everSynced ? String((millis() - lastSyncMillis) / 60000) + " min ago" : "never";
+
+  String page;
+  page.reserve(3000);
+  page += F("<!doctype html><html><head><meta charset=utf-8>"
+            "<meta name=viewport content='width=device-width,initial-scale=1'>"
+            "<title>WiFi Clock</title><style>"
+            "body{font-family:sans-serif;max-width:420px;margin:0 auto;padding:16px;background:#fff;color:#222}"
+            "label{display:block;margin:12px 0 4px}input{width:100%;padding:8px;box-sizing:border-box;font-size:16px}"
+            "button{margin-top:16px;padding:10px 16px;font-size:16px}small{color:#666}"
+            "@media(prefers-color-scheme:dark){body{background:#111;color:#eee}small{color:#999}}"
+            "</style></head><body><h1>WiFi Clock</h1>");
+  page += "<p>Time: <b>" + String(timeStr) + "</b><br><small>Last time sync: " + lastSync +
+          " &middot; WiFi: " + WiFi.SSID() + " (" + WiFi.RSSI() + " dBm) &middot; IP: " +
+          WiFi.localIP().toString() + "</small></p>";
+  if (server.hasArg("saved")) page += F("<p><b>Saved.</b></p>");
+  if (server.hasArg("badtz")) page += F("<p><b>Saved, but the time zone was not valid and was not changed.</b></p>");
+  page += F("<form method=post action=/save>");
+  page += "<label>Day brightness (0&ndash;10)</label>" + numberInput("day", settings.dayLevel, 0, 10);
+  page += "<label>Night brightness (0&ndash;10, 0 = off)</label>" + numberInput("night", settings.nightLevel, 0, 10);
+  page += "<label>Night starts at hour</label>" + numberInput("nstart", settings.nightStart, 0, 23);
+  page += "<label>Night ends at hour <small>(same as start = no night mode)</small></label>" +
+          numberInput("nend", settings.nightEnd, 0, 23);
+  page += "<label>Show date at second</label>" + numberInput("dat", settings.dateAtSecond, 0, 59);
+  page += "<label>Show date for seconds (0 = never)</label>" + numberInput("dsec", settings.dateSeconds, 0, 10);
+  page += "<label>Time zone <small>(POSIX TZ string)</small></label>"
+          "<input name=tz list=zones required value=\"" + String(settings.timeZone) + "\">";
+  page += F("<datalist id=zones>"
+            "<option value='CET-1CEST,M3.5.0,M10.5.0/3'>Central Europe</option>"
+            "<option value='GMT0BST,M3.5.0/1,M10.5.0'>UK</option>"
+            "<option value='EET-2EEST,M3.5.0/3,M10.5.0/4'>Eastern Europe</option>"
+            "<option value='EST5EDT,M3.2.0,M11.1.0'>US Eastern</option>"
+            "<option value='PST8PDT,M3.2.0,M11.1.0'>US Pacific</option>"
+            "<option value='JST-9'>Japan</option>"
+            "<option value='AEST-10AEDT,M10.1.0,M4.1.0/3'>Sydney</option>"
+            "<option value='UTC0'>UTC</option></datalist>");
+  page += F("<button type=submit>Save</button></form>"
+            "<form method=post action=/reset-wifi onsubmit=\"return confirm("
+            "'Forget the WiFi network? The clock will open the " SETUP_AP_NAME " network for setup.')\">"
+            "<button type=submit>Change WiFi network</button></form>"
+            "</body></html>");
+  server.send(200, "text/html", page);
+}
+
+void handleSave() {
+  auto num = [](const char *name, int min, int max, uint8_t current) -> uint8_t {
+    if (!server.hasArg(name)) return current;
+    int v = server.arg(name).toInt();
+    return constrain(v, min, max);
+  };
+  settings.dayLevel = num("day", 0, 10, settings.dayLevel);
+  settings.nightLevel = num("night", 0, 10, settings.nightLevel);
+  settings.nightStart = num("nstart", 0, 23, settings.nightStart);
+  settings.nightEnd = num("nend", 0, 23, settings.nightEnd);
+  settings.dateAtSecond = num("dat", 0, 59, settings.dateAtSecond);
+  settings.dateSeconds = num("dsec", 0, 10, settings.dateSeconds);
+  String tz = server.arg("tz");
+  tz.trim();
+  bool tzOk = validTimeZone(tz);
+  if (tzOk) strlcpy(settings.timeZone, tz.c_str(), sizeof(settings.timeZone));
+  saveSettings();
+  applyTimeZone();
+  Serial.println("Settings saved.");
+  server.sendHeader("Location", tzOk ? "/?saved=1" : "/?badtz=1");
+  server.send(303);
+}
+
+void handleResetWifi() {
+  server.send(200, "text/html",
+              "<meta name=viewport content='width=device-width'><p>WiFi settings cleared. "
+              "Connect to the <b>" SETUP_AP_NAME "</b> network to set up a new one.</p>");
+  delay(500);
+  wifiManager.resetSettings();
+  ESP.restart();
+}
+
+// ---- Setup / loop -----------------------------------------------------------
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n--- Clock Starting ---");
+
+  loadSettings();
+
+  pinMode(SS_PIN, OUTPUT);  
+
+  SPI.setBitOrder(MSBFIRST);
+  SPI.begin();
+
+  maxTransferCMD(MAX7219_TEST, 0x00);
+  maxTransferCMD(MAX7219_DECODE_MODE, 0x00); // Disable BCD mode. 
+  maxTransferCMD(MAX7219_BRIGHTNESS, BRIGHTNESS); // Set brightness (0x00 -> 0x0F)
+  maxTransferCMD(MAX7219_SCAN_LIMIT, 0x0f);  // Scan all digits.
+  draw_blank(false);
+  maxTransferCMD(MAX7219_SHUTDOWN, 0x01);    // Turn on chip.
+  Serial.println("MAX7219 initialized.");
+
+  dimOnMs = settings.dayLevel;
+  dimTicker.attach_ms(1, dimTick);
+
+  settimeofday_cb([](bool fromSntp) {
+    if (!fromSntp) return;
+    lastSyncMillis = millis();
+    everSynced = true;
+    Serial.println("Time synced.");
+  });
+  configTime(settings.timeZone, NTP_SERVER);   // Syncs in the background (hourly)
+  Serial.println("NTP initialized.");
+
+  // Join the saved WiFi network. If that fails, open the setup network
+  // (non-blocking: the clock keeps running while it is open).
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  wifiManager.setHostname(OTA_HOSTNAME);
+  wifiManager.setConfigPortalBlocking(false);
+  wifiManager.setConfigPortalTimeout(SETUP_PORTAL_SECONDS);
+  if (wifiManager.autoConnect(SETUP_AP_NAME)) {
+    Serial.println("WiFi connected to " + WiFi.SSID());
+  } else {
+    Serial.println("WiFi not connected, setup network open: " SETUP_AP_NAME);
+  }
+
+  // Wireless (OTA) updates. Stop the dimming ticker while flashing so it
+  // does not compete with the update for CPU time.
+  ArduinoOTA.setHostname(OTA_HOSTNAME);
+  if (strlen(OTA_PASSWORD) > 0) ArduinoOTA.setPassword(OTA_PASSWORD);
+  ArduinoOTA.onStart([]() {
+    dimTicker.detach();
+    Serial.println("OTA update starting...");
+  });
+  ArduinoOTA.onEnd([]() { Serial.println("\nOTA update done, rebooting."); });
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("OTA error %u\n", error);
+    dimTicker.attach_ms(1, dimTick);
+  });
+
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/save", HTTP_POST, handleSave);
+  server.on("/reset-wifi", HTTP_POST, handleResetWifi);
+}
+
+void loop() {      
+  wifiManager.process();                        // Runs the setup network while it is open
+
+  bool connected = WiFi.status() == WL_CONNECTED;
+
+  // Start OTA and the settings page once WiFi is up for the first time
+  static bool servicesStarted = false;
+  if (!servicesStarted && connected && !wifiManager.getConfigPortalActive()) {
+    Serial.println("WiFi connected! IP: " + WiFi.localIP().toString());
+    ArduinoOTA.begin();                         // Also starts mDNS (wifi-clock.local)
+    server.begin();
+    MDNS.addService("http", "tcp", 80);
+    servicesStarted = true;
+    Serial.println("Ready: http://" OTA_HOSTNAME ".local");
+  }
+  if (servicesStarted) {
+    ArduinoOTA.handle();
+    server.handleClient();
+  }
+
+  // After the setup network has closed, keep retrying the saved network
+  static unsigned long lastRetry = 0;
+  if (!connected && !wifiManager.getConfigPortalActive() && millis() - lastRetry > 60000UL) {
+    lastRetry = millis();
+    WiFi.begin();
+  }
+
+  // Redraw when the second changes; loop() itself runs continuously so OTA
+  // stays responsive and the colon blinks in step with the seconds
+  static time_t lastSecond = 0;
+  time_t nowSecond = time(nullptr);
+  if (nowSecond == lastSecond) {
+    delay(10);
+    return;
+  }
+  lastSecond = nowSecond;
+
+  if (!everSynced && millis() > RESTART_IF_NO_SYNC_MIN * 60UL * 1000UL) {
+    Serial.println("No time sync since power-up, restarting.");
+    ESP.restart();
+  }
+
+  static int debugCount = 0;
+  struct tm local;
+  if (readLocalTime(local)) {
+    dimOnMs = isNight(local.tm_hour) ? settings.nightLevel : settings.dayLevel;
+    bool stale = millis() - lastSyncMillis > STALE_AFTER_HOURS * 3600UL * 1000UL;
+    bool showDate = local.tm_sec >= settings.dateAtSecond &&
+                    local.tm_sec < settings.dateAtSecond + settings.dateSeconds;
+    if (showDate) {
+      draw_digits(local.tm_mday, local.tm_mon + 1, SEP_PERIOD, stale);
+    } else {
+      // Colon blinks: on during even seconds
+      draw_digits(local.tm_hour, local.tm_min,
+                  local.tm_sec % 2 == 0 ? SEP_COLON : SEP_NONE, stale);
+    }
+    if (debugCount < 5) {
+      char buf[12];
+      sprintf(buf, "%02d:%02d", local.tm_hour, local.tm_min);
+      Serial.print("Time: ");
+      Serial.print(buf);
+      Serial.print(" | WiFi: ");
+      Serial.print(WiFi.localIP().toString());
+      Serial.print(" | Epoch: ");
+      Serial.println((uint32_t)time(nullptr));
+      debugCount++;
+    }
+  } else {
+    static bool blink = false;
+    blink = !blink;
+    draw_blank(blink);                          // Blinking dot: waiting for time
+    if (debugCount < 10) {
+      Serial.println("NTP not ready yet...");
+      debugCount++;
+    }
+  }
+}

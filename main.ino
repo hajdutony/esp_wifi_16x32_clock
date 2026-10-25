@@ -1,9 +1,8 @@
 #include <SPI.h>
 #include <ESP8266WiFi.h>
-#include <WifiUDP.h>
-#include <NTPClient.h>
 #include <Ticker.h>
-#include "dst.h"
+#include <ArduinoOTA.h>
+#include <time.h>
 
 // ============================================================================
 // Configuration - edit these for your location
@@ -11,6 +10,9 @@
 
 const char* ssid         = "tony_NET";        // WiFi SSID
 const char* password     = "46237057";         // WiFi password
+
+#define OTA_HOSTNAME "wifi-clock"               // Network name for wireless updates
+#define OTA_PASSWORD ""                         // Set to require a password for updates
 
 #define SS_PIN 15                              // ESP8266 GPIO pin for MAX7219 CS
 
@@ -22,34 +24,32 @@ const char* password     = "46237057";         // WiFi password
 #define MAX7219_SHUTDOWN   0x0C
 
 // Brightness: hardware intensity (0x00 = lowest the MAX7219 can do), further
-// dimmed in software by blanking the display DIM_ON_MS out of every
-// DIM_PERIOD_MS milliseconds (3/10 = 30% of the lowest hardware brightness).
-// Set DIM_ON_MS = DIM_PERIOD_MS to disable software dimming.
+// dimmed in software by lighting the display only DAY_ON_MS / NIGHT_ON_MS out
+// of every DIM_PERIOD_MS milliseconds (3/10 = 30% of the lowest hardware
+// brightness). Set an *_ON_MS equal to DIM_PERIOD_MS for no software dimming.
 #define BRIGHTNESS    0x00
-#define DIM_ON_MS     3
 #define DIM_PERIOD_MS 10
+#define DAY_ON_MS     3                         // 30% during the day
+#define NIGHT_ON_MS   1                         // 10% at night
+#define NIGHT_START_HOUR 22                     // Night mode from 22:00...
+#define NIGHT_END_HOUR   7                      // ...until 07:00 (local time)
 
-// NTP settings
-#define NTP_INTERVAL 60 * 1000                 // Sync every 60 seconds
-#define NTP_ADDRESS  "1.asia.pool.ntp.org"
+// Time settings
+#define NTP_SERVER "europe.pool.ntp.org"
 
-// Timezone configuration
-#define BASE_UTC_OFFSET 3600                   // CET = UTC+1 (winter offset)
-#define DST_OFFSET      3600                   // CEST = UTC+2, i.e. +3600 over CET
-
-// To switch to a different timezone, adjust BASE_UTC_OFFSET:
-//   UTC:   0
-//   EST:  -18000 (UTC-5)
-//   PST:  -28800 (UTC-8)
-//   JST:  +32400 (UTC+9)
-// Then set DST_OFFSET to the extra seconds during DST (usually 3600).
-// For regions with no DST, set DST_OFFSET = 0.
-
-WiFiUDP ntpUDP;
-// Use 0 offset so NTPClient returns UTC; we apply DST dynamically in loop()
-NTPClient timeClient(ntpUDP, NTP_ADDRESS, 0, NTP_INTERVAL);
+// POSIX time zone string; the ESP8266 handles summer/winter time from it.
+// Europe/Bratislava: CET (UTC+1), CEST (UTC+2) from the last Sunday of March
+// 02:00 until the last Sunday of October 03:00. Other examples:
+//   UTC:            "UTC0"
+//   UK:             "GMT0BST,M3.5.0/1,M10.5.0"
+//   US Eastern:     "EST5EDT,M3.2.0,M11.1.0"
+//   US Pacific:     "PST8PDT,M3.2.0,M11.1.0"
+//   Japan:          "JST-9"
+//   Sydney:         "AEST-10AEDT,M10.1.0,M4.1.0/3"
+#define TIME_ZONE "CET-1CEST,M3.5.0,M10.5.0/3"
 
 Ticker dimTicker;
+uint8_t dimOnMs = DAY_ON_MS;                    // Current lit time, set from loop()
 
 uint8_t NUMBER[160] = {
   //0
@@ -234,13 +234,13 @@ void maxTransferCMD(uint8_t address, uint8_t value) {
   digitalWrite(SS_PIN, HIGH); // Finish transfer.
 }
 
-// Called every 1 ms: switch the display on for DIM_ON_MS, off for the rest
+// Called every 1 ms: switch the display on for dimOnMs, off for the rest
 // of the period. Ticker callbacks run between loop() yields, so they never
 // interrupt an SPI transfer in progress.
 void dimTick() {
   static uint8_t tick = 0;
   if (tick == 0) maxTransferCMD(MAX7219_SHUTDOWN, 0x01);
-  else if (tick == DIM_ON_MS) maxTransferCMD(MAX7219_SHUTDOWN, 0x00);
+  else if (tick == dimOnMs) maxTransferCMD(MAX7219_SHUTDOWN, 0x00);
   if (++tick >= DIM_PERIOD_MS) tick = 0;
 }
 
@@ -280,33 +280,21 @@ void draw_time(uint8_t hour, uint8_t minute) {
   }
 }
 
-// Convert a UTC epoch and apply the DST offset to get local time
-// Returns true if NTP has synced
+// Get the current local time (time zone and DST applied by the ESP8266)
+// Returns false until the first NTP sync
 bool getLocalTime(uint8_t &localHour, uint8_t &localMinute) {
-  timeClient.update();
-
-  if (!timeClient.isTimeSet()) {
-    // NTP hasn't synced yet
+  time_t now = time(nullptr);
+  if (now < 1700000000) {
+    // NTP hasn't synced yet (clock still counts from 1970)
     localHour = 0;
     localMinute = 0;
     return false;
   }
-  // Get the current UTC epoch
-  uint32_t utcEpoch = timeClient.getEpochTime();
 
-  // Get the current UTC offset for DST
-  int currentOffset = getDSTOffset(utcEpoch);
-
-  // Apply the offset to get local time
-  uint32_t localSeconds = utcEpoch + currentOffset;
-
-  // Handle day wrap-around (in case DST transition crosses midnight)
-  uint16_t year;
-  uint8_t month, day, hour, minute, second;
-  epochToTime(localSeconds, year, month, day, hour, minute, second);
-
-  localHour = hour;
-  localMinute = minute;
+  struct tm local;
+  localtime_r(&now, &local);
+  localHour = local.tm_hour;
+  localMinute = local.tm_min;
   return true;
 }
 
@@ -341,8 +329,24 @@ void setup() {
   }
   Serial.println("\nWiFi connected! IP: " + WiFi.localIP().toString());
   
-  timeClient.begin();
+  configTime(TIME_ZONE, NTP_SERVER);           // Syncs in the background (hourly)
   Serial.println("NTP initialized.");
+
+  // Wireless (OTA) updates. Stop the dimming ticker while flashing so it
+  // does not compete with the update for CPU time.
+  ArduinoOTA.setHostname(OTA_HOSTNAME);
+  if (strlen(OTA_PASSWORD) > 0) ArduinoOTA.setPassword(OTA_PASSWORD);
+  ArduinoOTA.onStart([]() {
+    dimTicker.detach();
+    Serial.println("OTA update starting...");
+  });
+  ArduinoOTA.onEnd([]() { Serial.println("\nOTA update done, rebooting."); });
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("OTA error %u\n", error);
+    dimTicker.attach_ms(1, dimTick);
+  });
+  ArduinoOTA.begin();
+  Serial.println("OTA ready: " OTA_HOSTNAME ".local");
 
   maxTransferCMD(MAX7219_DECODE_MODE, 0x00); // Disable BCD mode. 
   maxTransferCMD(MAX7219_BRIGHTNESS, BRIGHTNESS); // Set brightness (0x00 -> 0x0F)
@@ -350,13 +354,25 @@ void setup() {
   maxTransferCMD(MAX7219_SHUTDOWN, 0x01);    // Turn on chip.
   Serial.println("MAX7219 initialized.");
 
-  if (DIM_ON_MS < DIM_PERIOD_MS) dimTicker.attach_ms(1, dimTick);
+  dimTicker.attach_ms(1, dimTick);
 }
 
 void loop() {      
+  ArduinoOTA.handle();
+
+  // Redraw once per second; loop() itself runs continuously so OTA stays responsive
+  static unsigned long lastDraw = 0;
+  if (millis() - lastDraw < 1000) {
+    delay(10);
+    return;
+  }
+  lastDraw = millis();
+
   static int debugCount = 0;
   uint8_t localHour, localMinute;
   if (getLocalTime(localHour, localMinute)) {
+    bool night = localHour >= NIGHT_START_HOUR || localHour < NIGHT_END_HOUR;
+    dimOnMs = night ? NIGHT_ON_MS : DAY_ON_MS;
     draw_time(localHour, localMinute);
     if (debugCount < 5) {
       char buf[12];
@@ -366,7 +382,7 @@ void loop() {
       Serial.print(" | WiFi: ");
       Serial.print(WiFi.localIP().toString());
       Serial.print(" | Epoch: ");
-      Serial.println(timeClient.getEpochTime());
+      Serial.println((uint32_t)time(nullptr));
       debugCount++;
     }
   } else {
@@ -375,5 +391,4 @@ void loop() {
       debugCount++;
     }
   }
-  delay(1000); 
 }

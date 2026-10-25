@@ -8,7 +8,8 @@ WiFi-connected NTP clock driving eight cascaded MAX7219 8×8 LED modules (16×32
 - **Settings page** at <http://wifi-clock.local> — brightness, night hours, time zone and date display, saved in flash
 - **NTP time sync** via `europe.pool.ntp.org` (hourly, in the background)
 - **Automatic summer/winter time** using the ESP8266's built-in POSIX time zone support (default: Central Europe, CET/CEST)
-- **Day/night brightness** — default 30% of the lowest hardware level by day, 10% from 22:00 to 07:00
+- **Day/night brightness** — default 30% of the lowest hardware level by day, 10% at night
+- **Automatic night mode** — night runs from civil dusk to dawn (sun 6° below the horizon), calculated on the clock for your location and following summer/winter time; or use fixed hours
 - **Blinking colon** between hours and minutes (once per second)
 - **Date** shown as `DD.MM` for 3 seconds every minute (from second 30)
 - **Status dot** (bottom-right pixel) — blinking: waiting for the first time sync; steady: no sync for over 3 hours
@@ -37,7 +38,9 @@ Open <http://wifi-clock.local> (or the clock's IP address) from any device on th
 |---|---|---|
 | Day brightness | 3 | 0–10 = 0–100% of the lowest hardware brightness |
 | Night brightness | 1 | 0 turns the display off at night |
-| Night starts / ends at hour | 22 / 7 | Same hour for both = no night mode |
+| Automatic night (dusk to dawn) | on | Civil twilight for the location below; the page shows today's dawn and dusk |
+| Latitude / longitude | 48.7164 / 21.2611 | Košice; any point within ~20 km is accurate enough |
+| Fixed night starts / ends at hour | 22 / 7 | Used when automatic is off (or in polar regions on days the sun doesn't reach dusk/dawn); same hour for both = no night mode |
 | Show date at second / for seconds | 30 / 3 | 0 seconds = never show the date |
 | Time zone | `CET-1CEST,M3.5.0,M10.5.0/3` | POSIX TZ string; the field suggests common zones |
 
@@ -89,3 +92,4 @@ arduino-cli upload -p wifi-clock.local --protocol network --upload-field passwor
 | File | Description |
 |------|-------------|
 | `esp_wifi_16x32_clock.ino` | The sketch — display, WiFi setup, NTP/time zone, settings page, OTA |
+| `sun.h`, `sun.cpp` | Civil dawn/dusk calculation (Almanac for Computers algorithm, ~1 min accuracy) |

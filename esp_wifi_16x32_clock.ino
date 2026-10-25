@@ -8,6 +8,7 @@
 #include <ArduinoOTA.h>
 #include <time.h>
 #include <coredecls.h>                      // settimeofday_cb()
+#include "sun.h"
 
 // ============================================================================
 // Configuration
@@ -43,8 +44,11 @@
 // Defaults (first boot / after a settings reset)
 #define DEFAULT_DAY_LEVEL       3               // 30% during the day
 #define DEFAULT_NIGHT_LEVEL     1               // 10% at night
-#define DEFAULT_NIGHT_START     22              // Night mode from 22:00...
-#define DEFAULT_NIGHT_END       7               // ...until 07:00 (local time)
+#define DEFAULT_AUTO_NIGHT      1               // Night = civil dusk to dawn (sun 6 deg below horizon)
+#define DEFAULT_LATITUDE        48.7164         // Location for dusk/dawn: Kosice city centre
+#define DEFAULT_LONGITUDE       21.2611
+#define DEFAULT_NIGHT_START     22              // Fixed night hours, used when automatic is off
+#define DEFAULT_NIGHT_END       7               // (or the sun never sets/rises that day)
 #define DEFAULT_DATE_AT_SECOND  30              // Show the date from second 30...
 #define DEFAULT_DATE_SECONDS    3               // ...for 3 seconds (0 = never)
 
@@ -67,7 +71,8 @@
 #define RESTART_IF_NO_SYNC_MIN 10
 
 // Settings saved in flash (EEPROM emulation)
-#define SETTINGS_MAGIC 0xC10C0001               // Change when the struct layout changes
+#define SETTINGS_MAGIC    0xC10C0002            // Change when the struct layout changes
+#define SETTINGS_MAGIC_V1 0xC10C0001            // Layout without the automatic night fields
 struct Settings {
   uint32_t magic;
   uint8_t dayLevel;                             // 0-10
@@ -77,8 +82,17 @@ struct Settings {
   uint8_t dateAtSecond;                         // 0-59
   uint8_t dateSeconds;                          // 0-10, 0 = never show the date
   char timeZone[64];
+  // Added in layout 2
+  uint8_t autoNight;                            // 1 = night from civil dusk to dawn
+  float latitude;
+  float longitude;
 };
 Settings settings;
+
+// Today's civil dawn/dusk (UTC epochs), recalculated when the date changes
+time_t todayDawn = 0, todayDusk = 0;
+bool twilightValid = false;
+int twilightDay = -1;                           // tm_yday the values are for, -1 = recalculate
 
 Ticker dimTicker;
 uint8_t dimOnMs = DEFAULT_DAY_LEVEL;            // Current lit time, set from loop()
@@ -360,6 +374,13 @@ bool readLocalTime(struct tm &local) {
 
 // ---- Settings ---------------------------------------------------------------
 
+// Fields added in settings layout 2
+void defaultNewSettings() {
+  settings.autoNight = DEFAULT_AUTO_NIGHT;
+  settings.latitude = DEFAULT_LATITUDE;
+  settings.longitude = DEFAULT_LONGITUDE;
+}
+
 void defaultSettings() {
   settings.magic = SETTINGS_MAGIC;
   settings.dayLevel = DEFAULT_DAY_LEVEL;
@@ -369,13 +390,22 @@ void defaultSettings() {
   settings.dateAtSecond = DEFAULT_DATE_AT_SECOND;
   settings.dateSeconds = DEFAULT_DATE_SECONDS;
   strlcpy(settings.timeZone, DEFAULT_TIME_ZONE, sizeof(settings.timeZone));
+  defaultNewSettings();
 }
+
+void saveSettings();
 
 void loadSettings() {
   EEPROM.begin(sizeof(Settings));
   EEPROM.get(0, settings);
   settings.timeZone[sizeof(settings.timeZone) - 1] = '\0';
-  if (settings.magic != SETTINGS_MAGIC) {
+  if (settings.magic == SETTINGS_MAGIC_V1) {
+    // Keep the saved settings, add defaults for the new fields
+    Serial.println("Upgrading saved settings.");
+    settings.magic = SETTINGS_MAGIC;
+    defaultNewSettings();
+    saveSettings();
+  } else if (settings.magic != SETTINGS_MAGIC) {
     Serial.println("No saved settings, using defaults.");
     defaultSettings();
   }
@@ -397,6 +427,31 @@ bool isNight(uint8_t hour) {
   if (settings.nightStart < settings.nightEnd)
     return hour >= settings.nightStart && hour < settings.nightEnd;
   return hour >= settings.nightStart || hour < settings.nightEnd;
+}
+
+// Recalculate civil dawn/dusk when the local date changes
+void updateTwilight(const struct tm &local) {
+  if (local.tm_yday == twilightDay) return;
+  twilightDay = local.tm_yday;
+  twilightValid = civilTwilight(local.tm_year + 1900, local.tm_mon + 1, local.tm_mday,
+                                settings.latitude, settings.longitude, todayDawn, todayDusk);
+}
+
+// Night: between dusk and dawn in automatic mode, else the fixed hours
+bool isNightNow(time_t now, const struct tm &local) {
+  if (settings.autoNight) {
+    updateTwilight(local);
+    if (twilightValid) return now < todayDawn || now >= todayDusk;
+  }
+  return isNight(local.tm_hour);
+}
+
+String formatLocal(time_t t) {
+  struct tm tmv;
+  localtime_r(&t, &tmv);
+  char buf[8];
+  strftime(buf, sizeof(buf), "%H:%M", &tmv);
+  return buf;
 }
 
 // POSIX TZ strings only use these characters; rejecting anything else also
@@ -440,8 +495,25 @@ void handleRoot() {
   page += F("<form method=post action=/save>");
   page += "<label>Day brightness (0&ndash;10)</label>" + numberInput("day", settings.dayLevel, 0, 10);
   page += "<label>Night brightness (0&ndash;10, 0 = off)</label>" + numberInput("night", settings.nightLevel, 0, 10);
-  page += "<label>Night starts at hour</label>" + numberInput("nstart", settings.nightStart, 0, 23);
-  page += "<label>Night ends at hour <small>(same as start = no night mode)</small></label>" +
+  page += String("<label><input type=checkbox name=auto style='width:auto'") +
+          (settings.autoNight ? " checked" : "") +
+          "> Automatic night: from dusk to dawn (civil twilight)</label>";
+  if (settings.autoNight) {
+    struct tm today;
+    if (readLocalTime(today)) {
+      updateTwilight(today);
+      page += twilightValid
+                  ? "<small>Today: dawn " + formatLocal(todayDawn) + ", dusk " + formatLocal(todayDusk) + "</small>"
+                  : String("<small>The sun doesn't reach dusk/dawn today; using the fixed hours.</small>");
+    }
+  }
+  page += "<label>Latitude <small>(north +)</small></label><input type=number name=lat step=0.0001 min=-90 max=90 required value=" +
+          String(settings.latitude, 4) + ">";
+  page += "<label>Longitude <small>(east +)</small></label><input type=number name=lon step=0.0001 min=-180 max=180 required value=" +
+          String(settings.longitude, 4) + ">";
+  page += "<label>Fixed night starts at hour <small>(when automatic is off)</small></label>" +
+          numberInput("nstart", settings.nightStart, 0, 23);
+  page += "<label>Fixed night ends at hour <small>(same as start = no night mode)</small></label>" +
           numberInput("nend", settings.nightEnd, 0, 23);
   page += "<label>Show date at second</label>" + numberInput("dat", settings.dateAtSecond, 0, 59);
   page += "<label>Show date for seconds (0 = never)</label>" + numberInput("dsec", settings.dateSeconds, 0, 10);
@@ -476,6 +548,10 @@ void handleSave() {
   settings.nightEnd = num("nend", 0, 23, settings.nightEnd);
   settings.dateAtSecond = num("dat", 0, 59, settings.dateAtSecond);
   settings.dateSeconds = num("dsec", 0, 10, settings.dateSeconds);
+  settings.autoNight = server.hasArg("auto") ? 1 : 0;   // Unticked checkboxes aren't sent
+  if (server.hasArg("lat")) settings.latitude = constrain(server.arg("lat").toFloat(), -90.0f, 90.0f);
+  if (server.hasArg("lon")) settings.longitude = constrain(server.arg("lon").toFloat(), -180.0f, 180.0f);
+  twilightDay = -1;                             // Recalculate dusk/dawn
   String tz = server.arg("tz");
   tz.trim();
   bool tzOk = validTimeZone(tz);
@@ -606,7 +682,7 @@ void loop() {
   static int debugCount = 0;
   struct tm local;
   if (readLocalTime(local)) {
-    dimOnMs = isNight(local.tm_hour) ? settings.nightLevel : settings.dayLevel;
+    dimOnMs = isNightNow(nowSecond, local) ? settings.nightLevel : settings.dayLevel;
     bool stale = millis() - lastSyncMillis > STALE_AFTER_HOURS * 3600UL * 1000UL;
     bool showDate = local.tm_sec >= settings.dateAtSecond &&
                     local.tm_sec < settings.dateAtSecond + settings.dateSeconds;

@@ -8,7 +8,7 @@ WiFi-connected NTP clock driving eight cascaded MAX7219 8×8 LED modules (16×32
 - **Settings page** at <http://wifi-clock.local> — brightness, night hours, time zone and date display, saved in flash
 - **NTP time sync** via `europe.pool.ntp.org` (hourly, in the background)
 - **Automatic summer/winter time** using the ESP8266's built-in POSIX time zone support (default: Central Europe, CET/CEST)
-- **Day/night brightness** — default 30% of the lowest hardware level by day, 10% at night
+- **Day/night brightness** — default 30% of the lowest hardware level by day, 10% at night (software dimming timed by the hardware timer; at 10% each row refreshes at ~80 Hz, so a faint shimmer is a limit of the MAX7219)
 - **Automatic night mode** — night runs from civil dusk to dawn (sun 6° below the horizon), calculated on the clock for your location and following summer/winter time; or use fixed hours
 - **Blinking colon** between hours and minutes (once per second)
 - **Date** shown as `DD.MM` for 3 seconds every minute (from second 30)

@@ -4,7 +4,6 @@
 #include <ESP8266mDNS.h>
 #include <WiFiManager.h>                        // https://github.com/tzapu/WiFiManager
 #include <EEPROM.h>
-#include <Ticker.h>
 #include <ArduinoOTA.h>
 #include <time.h>
 #include <coredecls.h>                      // settimeofday_cb()
@@ -36,7 +35,8 @@
 
 // Brightness: hardware intensity (0x00 = lowest the MAX7219 can do), further
 // dimmed in software by lighting the display only dimOnMs out of every
-// DIM_PERIOD_MS milliseconds. Brightness levels on the settings page are
+// DIM_PERIOD_MS milliseconds, timed by the hardware timer (timer1) so WiFi
+// activity can't stretch the lit time. Brightness levels on the settings page are
 // 0-10, i.e. 0-100% of the lowest hardware brightness in 10% steps.
 #define BRIGHTNESS    0x00
 #define DIM_PERIOD_MS 10
@@ -94,8 +94,15 @@ time_t todayDawn = 0, todayDusk = 0;
 bool twilightValid = false;
 int twilightDay = -1;                           // tm_yday the values are for, -1 = recalculate
 
-Ticker dimTicker;
-uint8_t dimOnMs = DEFAULT_DAY_LEVEL;            // Current lit time, set from loop()
+#define SPI_FREQUENCY 4000000                   // MAX7219 supports up to 10 MHz
+
+volatile uint8_t dimOnMs = DEFAULT_DAY_LEVEL;   // Current lit time, set from loop()
+
+// Display contents, written by loop() and sent to the MAX7219s by the timer
+// interrupt while the display is dark. frame[row][module], module 0 is sent
+// first in the chain (same order as the old maxTransferDATA v1..v8).
+volatile uint8_t frame[8][8];
+volatile bool frameDirty = false;
 unsigned long lastSyncMillis = 0;               // millis() of the last NTP sync
 bool everSynced = false;
 
@@ -285,37 +292,67 @@ void maxTransferCMD(uint8_t address, uint8_t value) {
   digitalWrite(SS_PIN, HIGH); // Finish transfer.
 }
 
-// Called every 1 ms: switch the display on for dimOnMs, off for the rest
-// of the period. Ticker callbacks run between loop() yields, so they never
-// interrupt an SPI transfer in progress.
-void dimTick() {
+// ---- Timer-driven display output ---------------------------------------------
+// All SPI traffic after setup() happens in the timer1 interrupt, so it can't
+// collide with anything in loop(). The interrupt only touches IRAM code and
+// hardware registers, so it is safe while flash is busy (OTA, settings save).
+
+// Send 8 (address, value) pairs - one per module - in a single 128-bit SPI
+// transfer, then latch them with a rising CS edge.
+static inline void IRAM_ATTR spiSendChain(uint8_t address, const volatile uint8_t *values) {
+  while (SPI1CMD & SPIBUSY) {}
+  const uint32_t bits = 8 * 16 - 1;
+  SPI1U1 = (SPI1U1 & ~((SPIMMOSI << SPILMOSI) | (SPIMMISO << SPILMISO))) |
+           (bits << SPILMOSI) | (bits << SPILMISO);
+  // The FIFO sends the lowest byte of SPI1W0 first
+  volatile uint32_t *fifo = &SPI1W0;
+  for (uint8_t i = 0; i < 4; i++) {
+    fifo[i] = address | (values[2 * i] << 8) | (address << 16) | ((uint32_t)values[2 * i + 1] << 24);
+  }
+  GPOC = 1 << SS_PIN;                           // CS low
+  SPI1CMD |= SPIBUSY;
+  while (SPI1CMD & SPIBUSY) {}
+  GPOS = 1 << SS_PIN;                           // CS high: latch
+}
+
+static inline void IRAM_ATTR spiSendAll(uint8_t address, uint8_t value) {
+  uint8_t values[8] = {value, value, value, value, value, value, value, value};
+  spiSendChain(address, values);
+}
+
+static void IRAM_ATTR sendFrame() {
+  frameDirty = false;
+  for (uint8_t row = 0; row < 8; row++) spiSendChain(row + 1, frame[row]);
+}
+
+// Every 1 ms: display on for dimOnMs, off for the rest of DIM_PERIOD_MS.
+// New digits are sent while the display is dark so they don't add lit time.
+void IRAM_ATTR dimIsr() {
   static uint8_t tick = 0;
-  if (tick == 0 && dimOnMs > 0) maxTransferCMD(MAX7219_SHUTDOWN, 0x01);
-  else if (tick == dimOnMs) maxTransferCMD(MAX7219_SHUTDOWN, 0x00);
+  uint8_t onMs = dimOnMs;
+  if (tick == 0 && onMs > 0) spiSendAll(MAX7219_SHUTDOWN, 0x01);
+  else if (tick == onMs) spiSendAll(MAX7219_SHUTDOWN, 0x00);
+  bool dark = tick >= onMs;
+  if (frameDirty && (dark || onMs >= DIM_PERIOD_MS)) sendFrame();
   if (++tick >= DIM_PERIOD_MS) tick = 0;
 }
 
-void maxTransferDATA(uint8_t address, uint8_t v1, uint8_t v2, uint8_t v3, uint8_t v4, uint8_t v5, uint8_t v6, uint8_t v7, uint8_t v8) {  
-  digitalWrite(SS_PIN, LOW);   
+void startDimTimer() {
+  timer1_attachInterrupt(dimIsr);
+  timer1_enable(TIM_DIV16, TIM_EDGE, TIM_LOOP); // 80 MHz / 16 = 5 MHz
+  timer1_write(5000);                           // 5000 ticks = 1 ms
+}
 
-  SPI.transfer(address);      // Send the value.
-  SPI.transfer(v1);           // Send the value.
-  SPI.transfer(address);      // Send address. 
-  SPI.transfer(v2);           // Send the value.
-  SPI.transfer(address);      // Send address. 
-  SPI.transfer(v3);           // Send the value.
-  SPI.transfer(address);      // Send address. 
-  SPI.transfer(v4);           // Send the value.
-  SPI.transfer(address);      // Send address. 
-  SPI.transfer(v5);           // Send the value.
-  SPI.transfer(address);      // Send address. 
-  SPI.transfer(v6);           // Send the value.
-  SPI.transfer(address);      // Send address. 
-  SPI.transfer(v7);           // Send the value.
-  SPI.transfer(address);      // Send address. 
-  SPI.transfer(v8);           // Send the value.
+void stopDimTimer() {
+  timer1_disable();
+  timer1_detachInterrupt();
+}
 
-  digitalWrite(SS_PIN, HIGH); // Finish transfer.
+// Store one row for all 8 modules; the draw functions set frameDirty when done
+void setRow(uint8_t row, uint8_t v1, uint8_t v2, uint8_t v3, uint8_t v4,
+            uint8_t v5, uint8_t v6, uint8_t v7, uint8_t v8) {
+  frame[row][0] = v1; frame[row][1] = v2; frame[row][2] = v3; frame[row][3] = v4;
+  frame[row][4] = v5; frame[row][5] = v6; frame[row][6] = v7; frame[row][7] = v8;
 }
 
 // Separator drawn in the 2 middle columns between the digit pairs
@@ -345,7 +382,7 @@ void draw_digits(uint8_t left, uint8_t right, uint8_t sep, bool dot) {
   uint8_t d = right % 10;
   for (uint8_t i = 0; i < 8; i++) {
     uint8_t top = i, bottom = i + 8;
-    maxTransferDATA(i + 1, digitRow(a, top, true),
+    setRow(i, digitRow(a, top, true),
                     digitRow(b, top, true) | (sepPixel(sep, top) ? 0x01 : 0x00),
                     digitRow(c, top, false) | (sepPixel(sep, top) ? 0x80 : 0x00),
                     digitRow(d, top, false),
@@ -354,13 +391,15 @@ void draw_digits(uint8_t left, uint8_t right, uint8_t sep, bool dot) {
                     digitRow(c, bottom, false) | (sepPixel(sep, bottom) ? 0x80 : 0x00),
                     digitRow(d, bottom, false) | ((dot && i == 7) ? 0x01 : 0x00));
   }
+  frameDirty = true;
 }
 
 // Blank display with only the status dot (before the first time sync)
 void draw_blank(bool dot) {
   for (uint8_t i = 0; i < 8; i++) {
-    maxTransferDATA(i + 1, 0, 0, 0, 0, 0, 0, 0, (dot && i == 7) ? 0x01 : 0x00);
+    setRow(i, 0, 0, 0, 0, 0, 0, 0, (dot && i == 7) ? 0x01 : 0x00);
   }
+  frameDirty = true;
 }
 
 // Get the current local time (time zone and DST applied by the ESP8266)
@@ -584,17 +623,19 @@ void setup() {
 
   SPI.setBitOrder(MSBFIRST);
   SPI.begin();
+  SPI.setFrequency(SPI_FREQUENCY);
 
   maxTransferCMD(MAX7219_TEST, 0x00);
   maxTransferCMD(MAX7219_DECODE_MODE, 0x00); // Disable BCD mode. 
   maxTransferCMD(MAX7219_BRIGHTNESS, BRIGHTNESS); // Set brightness (0x00 -> 0x0F)
   maxTransferCMD(MAX7219_SCAN_LIMIT, 0x0f);  // Scan all digits.
   draw_blank(false);
+  sendFrame();                               // Timer isn't running yet
   maxTransferCMD(MAX7219_SHUTDOWN, 0x01);    // Turn on chip.
   Serial.println("MAX7219 initialized.");
 
   dimOnMs = settings.dayLevel;
-  dimTicker.attach_ms(1, dimTick);
+  startDimTimer();
 
   settimeofday_cb([](bool fromSntp) {
     if (!fromSntp) return;
@@ -623,13 +664,13 @@ void setup() {
   ArduinoOTA.setHostname(OTA_HOSTNAME);
   if (strlen(OTA_PASSWORD) > 0) ArduinoOTA.setPassword(OTA_PASSWORD);
   ArduinoOTA.onStart([]() {
-    dimTicker.detach();
+    stopDimTimer();
     Serial.println("OTA update starting...");
   });
   ArduinoOTA.onEnd([]() { Serial.println("\nOTA update done, rebooting."); });
   ArduinoOTA.onError([](ota_error_t error) {
     Serial.printf("OTA error %u\n", error);
-    dimTicker.attach_ms(1, dimTick);
+    startDimTimer();
   });
 
   server.on("/", HTTP_GET, handleRoot);

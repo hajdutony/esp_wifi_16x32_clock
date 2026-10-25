@@ -2,6 +2,7 @@
 #include <ESP8266WiFi.h>
 #include <WifiUDP.h>
 #include <NTPClient.h>
+#include <Ticker.h>
 #include "dst.h"
 
 // ============================================================================
@@ -19,6 +20,14 @@ const char* password     = "46237057";         // WiFi password
 #define MAX7219_SCAN_LIMIT 0x0b
 #define MAX7219_DECODE_MODE 0x09
 #define MAX7219_SHUTDOWN   0x0C
+
+// Brightness: hardware intensity (0x00 = lowest the MAX7219 can do), further
+// dimmed in software by blanking the display DIM_ON_MS out of every
+// DIM_PERIOD_MS milliseconds (3/10 = 30% of the lowest hardware brightness).
+// Set DIM_ON_MS = DIM_PERIOD_MS to disable software dimming.
+#define BRIGHTNESS    0x00
+#define DIM_ON_MS     3
+#define DIM_PERIOD_MS 10
 
 // NTP settings
 #define NTP_INTERVAL 60 * 1000                 // Sync every 60 seconds
@@ -39,6 +48,8 @@ const char* password     = "46237057";         // WiFi password
 WiFiUDP ntpUDP;
 // Use 0 offset so NTPClient returns UTC; we apply DST dynamically in loop()
 NTPClient timeClient(ntpUDP, NTP_ADDRESS, 0, NTP_INTERVAL);
+
+Ticker dimTicker;
 
 uint8_t NUMBER[160] = {
   //0
@@ -223,6 +234,16 @@ void maxTransferCMD(uint8_t address, uint8_t value) {
   digitalWrite(SS_PIN, HIGH); // Finish transfer.
 }
 
+// Called every 1 ms: switch the display on for DIM_ON_MS, off for the rest
+// of the period. Ticker callbacks run between loop() yields, so they never
+// interrupt an SPI transfer in progress.
+void dimTick() {
+  static uint8_t tick = 0;
+  if (tick == 0) maxTransferCMD(MAX7219_SHUTDOWN, 0x01);
+  else if (tick == DIM_ON_MS) maxTransferCMD(MAX7219_SHUTDOWN, 0x00);
+  if (++tick >= DIM_PERIOD_MS) tick = 0;
+}
+
 void maxTransferDATA(uint8_t address, uint8_t v1, uint8_t v2, uint8_t v3, uint8_t v4, uint8_t v5, uint8_t v6, uint8_t v7, uint8_t v8) {  
   digitalWrite(SS_PIN, LOW);   
 
@@ -324,10 +345,12 @@ void setup() {
   Serial.println("NTP initialized.");
 
   maxTransferCMD(MAX7219_DECODE_MODE, 0x00); // Disable BCD mode. 
-  maxTransferCMD(MAX7219_BRIGHTNESS, 0x08);  // Set brightness (0x00 -> 0x0F)
+  maxTransferCMD(MAX7219_BRIGHTNESS, BRIGHTNESS); // Set brightness (0x00 -> 0x0F)
   maxTransferCMD(MAX7219_SCAN_LIMIT, 0x0f);  // Scan all digits.
   maxTransferCMD(MAX7219_SHUTDOWN, 0x01);    // Turn on chip.
   Serial.println("MAX7219 initialized.");
+
+  if (DIM_ON_MS < DIM_PERIOD_MS) dimTicker.attach_ms(1, dimTick);
 }
 
 void loop() {      

@@ -10,6 +10,8 @@ WiFi-connected NTP clock driving eight cascaded MAX7219 8×8 LED modules (16×32
 - **Day/night brightness** — 30% of the lowest hardware level by day, 10% from 22:00 to 07:00
 - **Wireless (OTA) updates** — the clock is reachable as `wifi-clock.local`
 - **WiFi recovery** — connects and reconnects in the background; restarts itself if it never gets the time within 10 minutes of power-up
+- **Blinking colon** between hours and minutes (once per second)
+- **Date** shown as `DD.MM` for 3 seconds every minute (from second 30)
 - **Status dot** (bottom-right pixel) — blinking: waiting for the first time sync; steady: no sync for over 3 hours
 
 ## Hardware

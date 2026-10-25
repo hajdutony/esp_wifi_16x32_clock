@@ -3,6 +3,7 @@
 #include <Ticker.h>
 #include <ArduinoOTA.h>
 #include <time.h>
+#include <coredecls.h>                      // settimeofday_cb()
 
 // ============================================================================
 // Configuration - edit these for your location
@@ -48,8 +49,20 @@ const char* password     = "REMOVED";         // WiFi password
 //   Sydney:         "AEST-10AEDT,M10.1.0,M4.1.0/3"
 #define TIME_ZONE "CET-1CEST,M3.5.0,M10.5.0/3"
 
+// Status dot (bottom-right pixel): blinks while waiting for the first time
+// sync, stays on if the time has not been synced for STALE_AFTER_HOURS
+// (the ESP8266 normally re-syncs every hour).
+#define STALE_AFTER_HOURS 3
+
+// If the clock has never synced the time this many minutes after power-up
+// (e.g. WiFi stack stuck), restart it. Once the time is known the clock keeps
+// running on its own and WiFi reconnects automatically in the background.
+#define RESTART_IF_NO_SYNC_MIN 10
+
 Ticker dimTicker;
 uint8_t dimOnMs = DAY_ON_MS;                    // Current lit time, set from loop()
+unsigned long lastSyncMillis = 0;               // millis() of the last NTP sync
+bool everSynced = false;
 
 uint8_t NUMBER[160] = {
   //0
@@ -267,7 +280,8 @@ void maxTransferDATA(uint8_t address, uint8_t v1, uint8_t v2, uint8_t v3, uint8_
   digitalWrite(SS_PIN, HIGH); // Finish transfer.
 }
 
-void draw_time(uint8_t hour, uint8_t minute) {
+// dot: light the bottom-right pixel (status indicator)
+void draw_time(uint8_t hour, uint8_t minute, bool dot) {
   uint8_t a = hour / 10;
   uint8_t b = hour % 10;
   uint8_t c = minute / 10;
@@ -276,7 +290,15 @@ void draw_time(uint8_t hour, uint8_t minute) {
     maxTransferDATA(i + 1, NUMBER[i + a * 16], NUMBER[i + b * 16],
                     NUMBER[i + c * 16], NUMBER[i + d * 16],
                     NUMBER[i + 8 + a * 16], NUMBER[i + 8 + b * 16],
-                    NUMBER[i + 8 + c * 16], NUMBER[i + 8 + d * 16]);
+                    NUMBER[i + 8 + c * 16],
+                    NUMBER[i + 8 + d * 16] | ((dot && i == 7) ? 0x01 : 0x00));
+  }
+}
+
+// Blank display with only the status dot (before the first time sync)
+void draw_blank(bool dot) {
+  for (uint8_t i = 0; i < 8; i++) {
+    maxTransferDATA(i + 1, 0, 0, 0, 0, 0, 0, 0, (dot && i == 7) ? 0x01 : 0x00);
   }
 }
 
@@ -308,27 +330,29 @@ void setup() {
   SPI.begin();
 
   maxTransferCMD(MAX7219_TEST, 0x00);
-  
+  maxTransferCMD(MAX7219_DECODE_MODE, 0x00); // Disable BCD mode. 
+  maxTransferCMD(MAX7219_BRIGHTNESS, BRIGHTNESS); // Set brightness (0x00 -> 0x0F)
+  maxTransferCMD(MAX7219_SCAN_LIMIT, 0x0f);  // Scan all digits.
+  draw_blank(false);
+  maxTransferCMD(MAX7219_SHUTDOWN, 0x01);    // Turn on chip.
+  Serial.println("MAX7219 initialized.");
+
+  dimTicker.attach_ms(1, dimTick);
+
+  // Connect in the background; the ESP8266 keeps retrying and reconnects
+  // automatically if the connection drops later.
   Serial.print("Connecting to WiFi: ");
   Serial.println(ssid);
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
   WiFi.begin(ssid, password);
-  int wifiAttempts = 0;
-  while (WiFi.status() != WL_CONNECTED)
-  {
-    delay(200);
-    Serial.print(".");
-    wifiAttempts++;
-    if (wifiAttempts > 30) {
-      Serial.println("\nWiFi connection FAILED!");
-      // Display error pattern: flash all LEDs
-      for (uint8_t i = 0; i < 8; i++) {
-        maxTransferDATA(i + 1, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF);
-      }
-      while (true) delay(500);
-    }
-  }
-  Serial.println("\nWiFi connected! IP: " + WiFi.localIP().toString());
-  
+
+  settimeofday_cb([](bool fromSntp) {
+    if (!fromSntp) return;
+    lastSyncMillis = millis();
+    everSynced = true;
+    Serial.println("Time synced.");
+  });
   configTime(TIME_ZONE, NTP_SERVER);           // Syncs in the background (hourly)
   Serial.println("NTP initialized.");
 
@@ -345,20 +369,18 @@ void setup() {
     Serial.printf("OTA error %u\n", error);
     dimTicker.attach_ms(1, dimTick);
   });
-  ArduinoOTA.begin();
-  Serial.println("OTA ready: " OTA_HOSTNAME ".local");
-
-  maxTransferCMD(MAX7219_DECODE_MODE, 0x00); // Disable BCD mode. 
-  maxTransferCMD(MAX7219_BRIGHTNESS, BRIGHTNESS); // Set brightness (0x00 -> 0x0F)
-  maxTransferCMD(MAX7219_SCAN_LIMIT, 0x0f);  // Scan all digits.
-  maxTransferCMD(MAX7219_SHUTDOWN, 0x01);    // Turn on chip.
-  Serial.println("MAX7219 initialized.");
-
-  dimTicker.attach_ms(1, dimTick);
 }
 
 void loop() {      
-  ArduinoOTA.handle();
+  // Start OTA once WiFi is up for the first time
+  static bool otaStarted = false;
+  if (!otaStarted && WiFi.status() == WL_CONNECTED) {
+    Serial.println("WiFi connected! IP: " + WiFi.localIP().toString());
+    ArduinoOTA.begin();
+    otaStarted = true;
+    Serial.println("OTA ready: " OTA_HOSTNAME ".local");
+  }
+  if (otaStarted) ArduinoOTA.handle();
 
   // Redraw once per second; loop() itself runs continuously so OTA stays responsive
   static unsigned long lastDraw = 0;
@@ -368,12 +390,18 @@ void loop() {
   }
   lastDraw = millis();
 
+  if (!everSynced && millis() > RESTART_IF_NO_SYNC_MIN * 60UL * 1000UL) {
+    Serial.println("No time sync since power-up, restarting.");
+    ESP.restart();
+  }
+
   static int debugCount = 0;
   uint8_t localHour, localMinute;
   if (getLocalTime(localHour, localMinute)) {
     bool night = localHour >= NIGHT_START_HOUR || localHour < NIGHT_END_HOUR;
     dimOnMs = night ? NIGHT_ON_MS : DAY_ON_MS;
-    draw_time(localHour, localMinute);
+    bool stale = millis() - lastSyncMillis > STALE_AFTER_HOURS * 3600UL * 1000UL;
+    draw_time(localHour, localMinute, stale);
     if (debugCount < 5) {
       char buf[12];
       sprintf(buf, "%02d:%02d", localHour, localMinute);
@@ -386,6 +414,9 @@ void loop() {
       debugCount++;
     }
   } else {
+    static bool blink = false;
+    blink = !blink;
+    draw_blank(blink);                          // Blinking dot: waiting for time
     if (debugCount < 10) {
       Serial.println("NTP not ready yet...");
       debugCount++;

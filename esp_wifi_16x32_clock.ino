@@ -1,6 +1,7 @@
 #include <SPI.h>
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
+#include <ESP8266HTTPClient.h>
 #include <ESP8266mDNS.h>
 #include <WiFiManager.h>                        // https://github.com/tzapu/WiFiManager
 #include <EEPROM.h>
@@ -8,14 +9,15 @@
 #include <time.h>
 #include <coredecls.h>                      // settimeofday_cb()
 #include "sun.h"
+#include "weather.h"
 
 // ============================================================================
 // Configuration
 //
 // WiFi is set up from a phone: if the clock cannot join a known network it
 // opens its own network SETUP_AP_NAME; connect to it and pick your WiFi.
-// Brightness, night hours, time zone and the date display are changed on the
-// settings page at http://wifi-clock.local and saved in flash. The values
+// Brightness, night hours, time zone, the date and weather display are changed
+// on the settings page at http://wifi-clock.local and saved in flash. The values
 // below are only the defaults used on first boot.
 // ============================================================================
 
@@ -51,6 +53,9 @@
 #define DEFAULT_NIGHT_END       7               // (or the sun never sets/rises that day)
 #define DEFAULT_DATE_AT_SECOND  30              // Show the date from second 30...
 #define DEFAULT_DATE_SECONDS    3               // ...for 3 seconds (0 = never)
+#define DEFAULT_SHOW_WEATHER    1               // Weather (by day only)...
+#define DEFAULT_WEATHER_AT_SECOND 45            // ...from second 45...
+#define DEFAULT_WEATHER_SECONDS 3               // ...for 3 seconds (0 = never)
 
 // POSIX time zone string; the ESP8266 handles summer/winter time from it.
 // Europe/Bratislava: CET (UTC+1), CEST (UTC+2) from the last Sunday of March
@@ -65,13 +70,21 @@
 // (the ESP8266 normally re-syncs every hour).
 #define STALE_AFTER_HOURS 3
 
+// Weather from Open-Meteo (free, no account) for the saved location
+#define WEATHER_HOST "api.open-meteo.com"
+#define WEATHER_EVERY_MIN   15                  // Refresh interval
+#define WEATHER_RETRY_MIN   2                   // Retry after a failed request
+#define WEATHER_MAX_AGE_MIN 60                  // Don't show older data
+#define WEATHER_TIMEOUT_MS  3000
+
 // If the clock has never synced the time this many minutes after power-up
 // (e.g. WiFi stack stuck), restart it. Once the time is known the clock keeps
 // running on its own and WiFi reconnects automatically in the background.
 #define RESTART_IF_NO_SYNC_MIN 10
 
 // Settings saved in flash (EEPROM emulation)
-#define SETTINGS_MAGIC    0xC10C0002            // Change when the struct layout changes
+#define SETTINGS_MAGIC    0xC10C0003            // Change when the struct layout changes
+#define SETTINGS_MAGIC_V2 0xC10C0002            // Layout without the weather fields
 #define SETTINGS_MAGIC_V1 0xC10C0001            // Layout without the automatic night fields
 struct Settings {
   uint32_t magic;
@@ -86,6 +99,10 @@ struct Settings {
   uint8_t autoNight;                            // 1 = night from civil dusk to dawn
   float latitude;
   float longitude;
+  // Added in layout 3
+  uint8_t showWeather;                          // 1 = show the weather by day
+  uint8_t weatherAtSecond;                      // 0-59
+  uint8_t weatherSeconds;                       // 0-10, 0 = never show the weather
 };
 Settings settings;
 
@@ -105,6 +122,12 @@ volatile uint8_t frame[8][8];
 volatile bool frameDirty = false;
 unsigned long lastSyncMillis = 0;               // millis() of the last NTP sync
 bool everSynced = false;
+
+Weather weather;                                // Last weather received
+bool weatherValid = false;
+unsigned long weatherMillis = 0;                // millis() when it was received
+unsigned long lastWeatherTry = 0;
+bool weatherDue = true;                         // Fetch on the next chance
 
 WiFiManager wifiManager;
 ESP8266WebServer server(80);
@@ -375,7 +398,8 @@ bool sepPixel(uint8_t sep, uint8_t row) {
 
 // Draw two 2-digit numbers (e.g. hour/minute or day/month).
 // dot: light the bottom-right pixel (status indicator)
-void draw_digits(uint8_t left, uint8_t right, uint8_t sep, bool dot) {
+// rain: light the top-right pixel (rain expected within the hour)
+void draw_digits(uint8_t left, uint8_t right, uint8_t sep, bool dot, bool rain) {
   uint8_t a = left / 10;
   uint8_t b = left % 10;
   uint8_t c = right / 10;
@@ -385,7 +409,7 @@ void draw_digits(uint8_t left, uint8_t right, uint8_t sep, bool dot) {
     setRow(i, digitRow(a, top, true),
                     digitRow(b, top, true) | (sepPixel(sep, top) ? 0x01 : 0x00),
                     digitRow(c, top, false) | (sepPixel(sep, top) ? 0x80 : 0x00),
-                    digitRow(d, top, false),
+                    digitRow(d, top, false) | ((rain && i == 0) ? 0x01 : 0x00),
                     digitRow(a, bottom, true),
                     digitRow(b, bottom, true) | (sepPixel(sep, bottom) ? 0x01 : 0x00),
                     digitRow(c, bottom, false) | (sepPixel(sep, bottom) ? 0x80 : 0x00),
@@ -402,6 +426,102 @@ void draw_blank(bool dot) {
   frameDirty = true;
 }
 
+// ---- Weather screen ---------------------------------------------------------
+// Drawn on a 32x16 pixel canvas (bit 7 of each byte = leftmost pixel), then
+// copied to the frame: modules 0-3 are the top row, 4-7 the bottom row.
+
+uint8_t canvas[16][4];
+
+void canvasPixel(int x, int y) {
+  if (x >= 0 && x < 32 && y >= 0 && y < 16) canvas[y][x / 8] |= 0x80 >> (x % 8);
+}
+
+void canvasToFrame() {
+  for (uint8_t y = 0; y < 16; y++)
+    for (uint8_t m = 0; m < 4; m++) frame[y % 8][(y / 8) * 4 + m] = canvas[y][m];
+  frameDirty = true;
+}
+
+// Temperature characters: the clock digits (6 px wide), minus and degree sign
+#define CHAR_MINUS  10
+#define CHAR_DEGREE 11
+
+uint8_t charWidth(uint8_t ch) {
+  return ch == CHAR_MINUS ? 4 : ch == CHAR_DEGREE ? 3 : 6;
+}
+
+void drawChar(uint8_t ch, int x) {
+  for (uint8_t y = 0; y < 16; y++) {
+    for (uint8_t col = 0; col < charWidth(ch); col++) {
+      bool on;
+      if (ch == CHAR_MINUS) on = y == 8;
+      else if (ch == CHAR_DEGREE) on = (y == 1 || y == 3) ? col == 1 : y == 2 && col != 1;
+      else on = NUMBER[ch * 16 + y] & (0x40 >> col);   // Digits use bits 6..1
+      if (on) canvasPixel(x + col, y);
+    }
+  }
+}
+
+// Icon in columns 0-13, temperature centred in columns 14-31
+void draw_weather(const Weather &w, bool dot, bool rain) {
+  memset(canvas, 0, sizeof(canvas));
+  const uint16_t *icon = WEATHER_ICONS[weatherIcon(w.code)];
+  for (uint8_t y = 0; y < 16; y++)
+    for (uint8_t x = 0; x < 14; x++)
+      if (icon[y] & (0x8000 >> x)) canvasPixel(x, y);
+
+  uint8_t chars[5], n = 0;
+  int t = constrain(w.temperature, -99, 99);
+  if (t < 0) chars[n++] = CHAR_MINUS;
+  if (abs(t) >= 10) chars[n++] = abs(t) / 10;
+  chars[n++] = abs(t) % 10;
+  chars[n++] = CHAR_DEGREE;
+  int width = -1;
+  for (uint8_t i = 0; i < n; i++) width += charWidth(chars[i]) + 1;
+  if (width > 18) width -= charWidth(chars[--n]) + 1;    // -10 and colder: no room for the degree sign
+  int x = 14 + (18 - width) / 2;
+  for (uint8_t i = 0; i < n; i++) {
+    drawChar(chars[i], x);
+    x += charWidth(chars[i]) + 1;
+  }
+  if (dot) canvasPixel(31, 15);
+  if (rain) canvasPixel(31, 0);
+  canvasToFrame();
+}
+
+// ---- Weather data -----------------------------------------------------------
+
+// Blocks for up to WEATHER_TIMEOUT_MS; the display keeps running from the timer
+bool fetchWeather() {
+  char path[200];
+  weatherRequestPath(path, sizeof(path), settings.latitude, settings.longitude);
+  WiFiClient client;
+  HTTPClient http;
+  http.setTimeout(WEATHER_TIMEOUT_MS);
+  if (!http.begin(client, WEATHER_HOST, 80, path)) return false;
+  int status = http.GET();
+  bool ok = false;
+  if (status == HTTP_CODE_OK) {
+    Weather w;
+    if (parseWeather(http.getString().c_str(), w)) {
+      weather = w;
+      weatherValid = true;
+      weatherMillis = millis();
+      ok = true;
+    }
+  }
+  http.end();
+  if (ok) Serial.printf("Weather: %d C, %s%s\n", weather.temperature, weatherDescription(weather.code),
+                        weather.rainSoon ? ", rain soon" : "");
+  else Serial.printf("Weather request failed (HTTP %d)\n", status);
+  return ok;
+}
+
+bool weatherFresh() {
+  return settings.showWeather && weatherValid &&
+         millis() - weatherMillis < WEATHER_MAX_AGE_MIN * 60000UL;
+}
+
 // Get the current local time (time zone and DST applied by the ESP8266)
 // Returns false until the first NTP sync
 bool readLocalTime(struct tm &local) {
@@ -414,10 +534,17 @@ bool readLocalTime(struct tm &local) {
 // ---- Settings ---------------------------------------------------------------
 
 // Fields added in settings layout 2
-void defaultNewSettings() {
+void defaultV2Settings() {
   settings.autoNight = DEFAULT_AUTO_NIGHT;
   settings.latitude = DEFAULT_LATITUDE;
   settings.longitude = DEFAULT_LONGITUDE;
+}
+
+// Fields added in settings layout 3
+void defaultV3Settings() {
+  settings.showWeather = DEFAULT_SHOW_WEATHER;
+  settings.weatherAtSecond = DEFAULT_WEATHER_AT_SECOND;
+  settings.weatherSeconds = DEFAULT_WEATHER_SECONDS;
 }
 
 void defaultSettings() {
@@ -429,7 +556,8 @@ void defaultSettings() {
   settings.dateAtSecond = DEFAULT_DATE_AT_SECOND;
   settings.dateSeconds = DEFAULT_DATE_SECONDS;
   strlcpy(settings.timeZone, DEFAULT_TIME_ZONE, sizeof(settings.timeZone));
-  defaultNewSettings();
+  defaultV2Settings();
+  defaultV3Settings();
 }
 
 void saveSettings();
@@ -438,11 +566,12 @@ void loadSettings() {
   EEPROM.begin(sizeof(Settings));
   EEPROM.get(0, settings);
   settings.timeZone[sizeof(settings.timeZone) - 1] = '\0';
-  if (settings.magic == SETTINGS_MAGIC_V1) {
+  if (settings.magic == SETTINGS_MAGIC_V1 || settings.magic == SETTINGS_MAGIC_V2) {
     // Keep the saved settings, add defaults for the new fields
     Serial.println("Upgrading saved settings.");
+    if (settings.magic == SETTINGS_MAGIC_V1) defaultV2Settings();
+    defaultV3Settings();
     settings.magic = SETTINGS_MAGIC;
-    defaultNewSettings();
     saveSettings();
   } else if (settings.magic != SETTINGS_MAGIC) {
     Serial.println("No saved settings, using defaults.");
@@ -517,7 +646,7 @@ void handleRoot() {
   String lastSync = everSynced ? String((millis() - lastSyncMillis) / 60000) + " min ago" : "never";
 
   String page;
-  page.reserve(3000);
+  page.reserve(4000);
   page += F("<!doctype html><html><head><meta charset=utf-8>"
             "<meta name=viewport content='width=device-width,initial-scale=1'>"
             "<title>WiFi Clock</title><style>"
@@ -556,6 +685,18 @@ void handleRoot() {
           numberInput("nend", settings.nightEnd, 0, 23);
   page += "<label>Show date at second</label>" + numberInput("dat", settings.dateAtSecond, 0, 59);
   page += "<label>Show date for seconds (0 = never)</label>" + numberInput("dsec", settings.dateSeconds, 0, 10);
+  page += String("<label><input type=checkbox name=weather style='width:auto'") +
+          (settings.showWeather ? " checked" : "") +
+          "> Show the weather (by day, for the location above)</label>";
+  if (settings.showWeather) {
+    page += weatherValid
+                ? "<small>Now: " + String(weather.temperature) + " &deg;C, " + weatherDescription(weather.code) +
+                      (weather.rainSoon ? ", rain expected within the hour" : "") + " &middot; updated " +
+                      String((millis() - weatherMillis) / 60000) + " min ago</small>"
+                : String("<small>No weather data yet.</small>");
+  }
+  page += "<label>Show weather at second</label>" + numberInput("wat", settings.weatherAtSecond, 0, 59);
+  page += "<label>Show weather for seconds (0 = never)</label>" + numberInput("wsec", settings.weatherSeconds, 0, 10);
   page += "<label>Time zone <small>(POSIX TZ string)</small></label>"
           "<input name=tz list=zones required value=\"" + String(settings.timeZone) + "\">";
   page += F("<datalist id=zones>"
@@ -587,10 +728,14 @@ void handleSave() {
   settings.nightEnd = num("nend", 0, 23, settings.nightEnd);
   settings.dateAtSecond = num("dat", 0, 59, settings.dateAtSecond);
   settings.dateSeconds = num("dsec", 0, 10, settings.dateSeconds);
+  settings.weatherAtSecond = num("wat", 0, 59, settings.weatherAtSecond);
+  settings.weatherSeconds = num("wsec", 0, 10, settings.weatherSeconds);
   settings.autoNight = server.hasArg("auto") ? 1 : 0;   // Unticked checkboxes aren't sent
+  settings.showWeather = server.hasArg("weather") ? 1 : 0;
   if (server.hasArg("lat")) settings.latitude = constrain(server.arg("lat").toFloat(), -90.0f, 90.0f);
   if (server.hasArg("lon")) settings.longitude = constrain(server.arg("lon").toFloat(), -180.0f, 180.0f);
   twilightDay = -1;                             // Recalculate dusk/dawn
+  weatherDue = true;                            // Location may have changed
   String tz = server.arg("tz");
   tz.trim();
   bool tzOk = validTimeZone(tz);
@@ -723,16 +868,23 @@ void loop() {
   static int debugCount = 0;
   struct tm local;
   if (readLocalTime(local)) {
-    dimOnMs = isNightNow(nowSecond, local) ? settings.nightLevel : settings.dayLevel;
+    bool night = isNightNow(nowSecond, local);
+    dimOnMs = night ? settings.nightLevel : settings.dayLevel;
     bool stale = millis() - lastSyncMillis > STALE_AFTER_HOURS * 3600UL * 1000UL;
+    bool fresh = weatherFresh();
+    bool rain = fresh && weather.rainSoon;
     bool showDate = local.tm_sec >= settings.dateAtSecond &&
                     local.tm_sec < settings.dateAtSecond + settings.dateSeconds;
+    bool showWeather = !night && fresh && local.tm_sec >= settings.weatherAtSecond &&
+                       local.tm_sec < settings.weatherAtSecond + settings.weatherSeconds;
     if (showDate) {
-      draw_digits(local.tm_mday, local.tm_mon + 1, SEP_PERIOD, stale);
+      draw_digits(local.tm_mday, local.tm_mon + 1, SEP_PERIOD, stale, rain);
+    } else if (showWeather) {
+      draw_weather(weather, stale, rain);
     } else {
       // Colon blinks: on during even seconds
       draw_digits(local.tm_hour, local.tm_min,
-                  local.tm_sec % 2 == 0 ? SEP_COLON : SEP_NONE, stale);
+                  local.tm_sec % 2 == 0 ? SEP_COLON : SEP_NONE, stale, rain);
     }
     if (debugCount < 5) {
       char buf[12];
@@ -753,5 +905,13 @@ void loop() {
       Serial.println("NTP not ready yet...");
       debugCount++;
     }
+  }
+
+  // Refresh the weather right after a redraw, so the request delays nothing
+  static unsigned long weatherWait = 0;
+  if (connected && settings.showWeather && (weatherDue || millis() - lastWeatherTry > weatherWait)) {
+    weatherDue = false;
+    lastWeatherTry = millis();
+    weatherWait = (fetchWeather() ? WEATHER_EVERY_MIN : WEATHER_RETRY_MIN) * 60000UL;
   }
 }
